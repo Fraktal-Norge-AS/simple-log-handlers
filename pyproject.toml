@@ -1,0 +1,53 @@
+[project]
+name = "simple-log-handlers"
+version = "0.1.0"
+description = "Opinionated logging handlers for Datadog, OpenTelemetry, and CLI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Christian Johannessen", email = "christian.johannessen@fraktal.no" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28,<1.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Logging",
+]
+
+[project.urls]
+Homepage = "https://github.com/Fraktal-Norge-AS/simple-log-handlers"
+Source = "https://github.com/Fraktal-Norge-AS/simple-log-handlers"
+Issues = "https://github.com/Fraktal-Norge-AS/simple-log-handlers/issues"
+
+[build-system]
+requires = ["uv_build>=0.8.14"]
+build-backend = "uv_build"
+
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-sdk>=1.25",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::UserWarning"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
