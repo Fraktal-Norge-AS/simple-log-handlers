@@ -32,11 +32,6 @@ Issues = "https://github.com/Fraktal-Norge-AS/simple-log-handlers/issues"
 requires = ["uv_build>=0.8.14"]
 build-backend = "uv_build"
 
-[project.optional-dependencies]
-otel = [
-    "opentelemetry-sdk>=1.25",
-]
-
 [dependency-groups]
 dev = [
     "pyright>=1.1.409",

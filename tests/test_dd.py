@@ -40,9 +40,9 @@ def make_handler():
     """Factory that creates dd_handler instances and closes them after each test."""
     created: list[_DatadogHandler] = []
 
-    def _factory(*args: object, **kwargs: object) -> _DatadogHandler:
+    def _factory(api_key: str | None = "a" * 32, **kwargs: object) -> _DatadogHandler:
         kwargs.setdefault("send_localhost_logs", True)  # type: ignore[call-overload]
-        h = dd_handler(*args, **kwargs)  # type: ignore[arg-type]
+        h = dd_handler(api_key, **kwargs)  # type: ignore[arg-type]
         created.append(h)
         return h
 
@@ -58,15 +58,15 @@ def make_handler():
 # ---------------------------------------------------------------------------
 
 def test_returns_datadog_handler(make_handler):
-    assert isinstance(make_handler("key"), _DatadogHandler)
+    assert isinstance(make_handler(), _DatadogHandler)
 
 
 def test_default_level_is_warning(make_handler):
-    assert make_handler("key").level == logging.WARNING
+    assert make_handler().level == logging.WARNING
 
 
 def test_custom_level(make_handler):
-    assert make_handler("key", level=logging.DEBUG).level == logging.DEBUG
+    assert make_handler( level=logging.DEBUG).level == logging.DEBUG
 
 
 def test_empty_api_key_warns_when_no_env_fallback(monkeypatch):
@@ -81,26 +81,26 @@ def test_empty_api_key_warns_when_no_env_fallback(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_api_key_from_env_var(monkeypatch, make_handler):
-    monkeypatch.setenv("DD_API_KEY", "env-key")
-    h = make_handler()
+    monkeypatch.setenv("DD_API_KEY", "e" * 32)
+    h = make_handler(None)  # no explicit key so env var takes effect
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
-        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "env-key"
+        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "e" * 32
 
 
 def test_explicit_api_key_takes_precedence_over_env(monkeypatch, make_handler):
-    monkeypatch.setenv("DD_API_KEY", "env-key")
-    h = make_handler("explicit-key")
+    monkeypatch.setenv("DD_API_KEY", "e" * 32)
+    h = make_handler("f" * 32)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
-        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "explicit-key"
+        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "f" * 32
 
 
 def test_site_from_env_var(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SITE", "datadoghq.eu")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -109,7 +109,7 @@ def test_site_from_env_var(monkeypatch, make_handler):
 
 def test_explicit_site_takes_precedence_over_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SITE", "datadoghq.eu")
-    h = make_handler("key", site="datadoghq.com")
+    h = make_handler( site="datadoghq.com")
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -165,7 +165,7 @@ def test_hostname_returns_empty_string_on_socket_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_emit_posts_to_correct_url(make_handler):
-    h = make_handler("my-key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -175,15 +175,15 @@ def test_emit_posts_to_correct_url(make_handler):
 
 
 def test_emit_sends_api_key_header(make_handler):
-    h = make_handler("my-key")
+    h = make_handler("b" * 32)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
-        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "my-key"
+        assert mock_post.call_args[1]["headers"]["DD-API-KEY"] == "b" * 32
 
 
 def test_eu_site(make_handler):
-    h = make_handler("key", site="datadoghq.eu")
+    h = make_handler( site="datadoghq.eu")
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -191,7 +191,7 @@ def test_eu_site(make_handler):
 
 
 def test_raise_for_status_called(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -199,7 +199,7 @@ def test_raise_for_status_called(make_handler):
 
 
 def test_http_error_response_does_not_raise(make_handler):
-    h = make_handler("key", max_retries=0)
+    h = make_handler( max_retries=0)
     error = httpx.HTTPStatusError("403", request=MagicMock(), response=MagicMock())
     error.response.status_code = 403
     error.response.headers = {}
@@ -210,7 +210,7 @@ def test_http_error_response_does_not_raise(make_handler):
 
 
 def test_close_shuts_down_client(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "close") as mock_close:
         h.close()
         mock_close.assert_called_once()
@@ -222,7 +222,7 @@ def test_close_shuts_down_client(make_handler):
 
 def test_emit_returns_immediately(make_handler):
     # emit() must not block on I/O — it puts to the queue and returns.
-    h = make_handler("key")
+    h = make_handler()
     ready = threading.Event()
 
     def slow_post(*args: object, **kwargs: object) -> MagicMock:
@@ -239,7 +239,7 @@ def test_emit_returns_immediately(make_handler):
 
 
 def test_flush_waits_for_delivery(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     delivered = threading.Event()
 
     def noting_post(*args: object, **kwargs: object) -> MagicMock:
@@ -253,7 +253,7 @@ def test_flush_waits_for_delivery(make_handler):
 
 
 def test_close_drains_queue(make_handler):
-    h = make_handler("key", batch_timeout=10.0)
+    h = make_handler( batch_timeout=10.0)
     call_count = 0
 
     def counting_post(*args: object, **kwargs: object) -> MagicMock:
@@ -275,7 +275,7 @@ def test_close_drains_queue(make_handler):
 
 def test_multiple_records_sent_in_one_batch(make_handler):
     # batch_size=10, emit 3 records, flush — should be one POST with 3 items.
-    h = make_handler("key", batch_size=10, batch_timeout=5.0, compress=False)
+    h = make_handler( batch_size=10, batch_timeout=5.0, compress=False)
     with patch.object(h._client, "post") as mock_post:
         for _ in range(3):
             h.emit(_make_record())
@@ -288,7 +288,7 @@ def test_multiple_records_sent_in_one_batch(make_handler):
 
 def test_batch_size_triggers_send(make_handler):
     # batch_size=2: after 2 records a batch fires without waiting for timeout.
-    h = make_handler("key", batch_size=2, batch_timeout=60.0, compress=False)
+    h = make_handler( batch_size=2, batch_timeout=60.0, compress=False)
     sent: list[int] = []
 
     def capture_post(*args: object, **kwargs: object) -> MagicMock:
@@ -309,7 +309,7 @@ def test_batch_size_triggers_send(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_retry_on_transient_http_error(make_handler):
-    h = make_handler("key", max_retries=2, batch_timeout=0.01)
+    h = make_handler( max_retries=2, batch_timeout=0.01)
     attempt = 0
 
     def flaky_post(*args: object, **kwargs: object) -> MagicMock:
@@ -323,7 +323,7 @@ def test_retry_on_transient_http_error(make_handler):
         return MagicMock()
 
     with patch.object(h._client, "post", side_effect=flaky_post):
-        with patch("simple_log_handlers._dd.time.sleep"):  # skip backoff wait
+        with patch.object(h._stop_event, "wait", return_value=False):  # skip backoff wait
             h.emit(_make_record())
             h.flush()
 
@@ -331,7 +331,7 @@ def test_retry_on_transient_http_error(make_handler):
 
 
 def test_no_retry_on_non_transient_error(make_handler):
-    h = make_handler("key", max_retries=3, batch_timeout=0.01)
+    h = make_handler( max_retries=3, batch_timeout=0.01)
     attempt = 0
 
     def bad_key_post(*args: object, **kwargs: object) -> MagicMock:
@@ -350,11 +350,8 @@ def test_no_retry_on_non_transient_error(make_handler):
 
 
 def test_retry_after_header_honored(make_handler):
-    h = make_handler("key", max_retries=1, batch_timeout=0.01)
-    sleeps: list[float] = []
-
-    def capture_sleep(secs: float) -> None:
-        sleeps.append(secs)
+    h = make_handler( max_retries=1, batch_timeout=0.01)
+    waits: list[float] = []
 
     attempt = 0
 
@@ -369,15 +366,15 @@ def test_retry_after_header_honored(make_handler):
         return MagicMock()
 
     with patch.object(h._client, "post", side_effect=rate_limited):
-        with patch("simple_log_handlers._dd.time.sleep", side_effect=capture_sleep):
+        with patch.object(h._stop_event, "wait", side_effect=lambda secs: waits.append(secs) or False):
             h.emit(_make_record())
             h.flush()
 
-    assert sleeps[0] == pytest.approx(7.0)
+    assert waits[0] == pytest.approx(7.0)
 
 
 def test_network_failure_does_not_crash_worker(make_handler):
-    h = make_handler("key", max_retries=0, batch_timeout=0.01)
+    h = make_handler( max_retries=0, batch_timeout=0.01)
     with patch.object(h._client, "post", side_effect=ConnectionError("refused")):
         h.emit(_make_record())
         h.flush()  # must not raise or stall
@@ -388,12 +385,12 @@ def test_network_failure_does_not_crash_worker(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_default_timeout(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     assert h._client.timeout.connect == 5.0
 
 
 def test_custom_timeout(make_handler):
-    h = make_handler("key", timeout=1.5)
+    h = make_handler( timeout=1.5)
     assert h._client.timeout.connect == 1.5
 
 
@@ -402,7 +399,7 @@ def test_custom_timeout(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_emit_payload_fields(make_handler):
-    h = make_handler("key", service="svc", env="prod", source="myapp")
+    h = make_handler( service="svc", env="prod", source="myapp")
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record("something broke", logging.ERROR))
         p = _payload(mock_post, h)
@@ -415,7 +412,7 @@ def test_emit_payload_fields(make_handler):
 
 
 def test_emit_timestamp_is_milliseconds(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     record = _make_record()
     with patch.object(h._client, "post") as mock_post:
         h.emit(record)
@@ -423,7 +420,7 @@ def test_emit_timestamp_is_milliseconds(make_handler):
 
 
 def test_emit_tags_merged_with_env(make_handler):
-    h = make_handler("key", env="staging", tags=["team:backend", "version:2"])
+    h = make_handler( env="staging", tags=["team:backend", "version:2"])
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         tags = _payload(mock_post, h)["ddtags"].split(",")
@@ -434,7 +431,7 @@ def test_emit_tags_merged_with_env(make_handler):
 
 
 def test_emit_no_service_key_when_omitted(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "service" not in _payload(mock_post, h)
@@ -445,21 +442,21 @@ def test_emit_no_service_key_when_omitted(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_status_warning_maps_to_warn(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record(level=logging.WARNING))
         assert _payload(mock_post, h)["status"] == "warn"
 
 
 def test_status_critical_maps_to_critical(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record(level=logging.CRITICAL))
         assert _payload(mock_post, h)["status"] == "critical"
 
 
 def test_status_info_maps_to_info(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record(level=logging.INFO))
         assert _payload(mock_post, h)["status"] == "info"
@@ -470,7 +467,7 @@ def test_status_info_maps_to_info(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_compress_default_on(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -480,7 +477,7 @@ def test_compress_default_on(make_handler):
 
 
 def test_compress_false_sends_plain_json(make_handler):
-    h = make_handler("key", compress=False)
+    h = make_handler( compress=False)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record("plain"))
         p = _payload(mock_post, h, compressed=False)
@@ -489,8 +486,8 @@ def test_compress_false_sends_plain_json(make_handler):
 
 
 def test_compressed_body_is_smaller_than_plain(make_handler):
-    plain_h = make_handler("key", compress=False)
-    compressed_h = make_handler("key", compress=True)
+    plain_h = make_handler( compress=False)
+    compressed_h = make_handler( compress=True)
     record = _make_record("a" * 500)
     with patch.object(plain_h._client, "post") as p1:
         plain_h.emit(record)
@@ -508,7 +505,7 @@ def test_compressed_body_is_smaller_than_plain(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_emit_does_not_raise_on_network_failure(make_handler):
-    h = make_handler("key", max_retries=0)
+    h = make_handler( max_retries=0)
     with patch.object(h._client, "post", side_effect=ConnectionError("refused")):
         h.emit(_make_record())
         h.flush()  # must not propagate
@@ -519,7 +516,7 @@ def test_emit_does_not_raise_on_network_failure(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_exception_populates_error_fields(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     logger = logging.getLogger("test.exc")
     logger.handlers.clear()
     logger.propagate = False
@@ -539,7 +536,7 @@ def test_exception_populates_error_fields(make_handler):
 
 
 def test_no_error_fields_without_exception(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record(level=logging.ERROR))
         p = _payload(mock_post, h)
@@ -550,7 +547,7 @@ def test_no_error_fields_without_exception(make_handler):
 
 
 def test_user_formatter_not_overridden_by_handler(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     h.setFormatter(logging.Formatter("CUSTOM %(message)s"))
     with patch.object(h._client, "post") as mock_post:
         try:
@@ -572,7 +569,7 @@ def test_user_formatter_not_overridden_by_handler(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_non_serialisable_extra_does_not_drop_log(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     record = _make_record("event")
     record.ts = datetime(2026, 1, 1)       # type: ignore[attr-defined]
     record.uid = uuid.UUID(int=0)          # type: ignore[attr-defined]
@@ -594,7 +591,7 @@ def test_non_serialisable_extra_does_not_drop_log(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_extra_cannot_overwrite_status(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     record = _make_record(level=logging.ERROR)
     record.status = "fake"  # type: ignore[attr-defined]
 
@@ -604,7 +601,7 @@ def test_extra_cannot_overwrite_status(make_handler):
 
 
 def test_extra_cannot_overwrite_service(make_handler):
-    h = make_handler("key", service="real-service")
+    h = make_handler( service="real-service")
     record = _make_record()
     record.service = "spoofed"  # type: ignore[attr-defined]
 
@@ -614,7 +611,7 @@ def test_extra_cannot_overwrite_service(make_handler):
 
 
 def test_extra_cannot_overwrite_error_fields(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     logger = logging.getLogger("test.reserved")
     logger.handlers.clear()
     logger.propagate = False
@@ -636,7 +633,7 @@ def test_extra_cannot_overwrite_error_fields(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_extra_fields_forwarded_to_payload(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     record = logging.LogRecord(
         name="test.extra", level=logging.ERROR, pathname="", lineno=0,
         msg="something", args=(), exc_info=None,
@@ -652,7 +649,7 @@ def test_extra_fields_forwarded_to_payload(make_handler):
 
 
 def test_standard_record_attrs_not_in_payload(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         p = _payload(mock_post, h)
@@ -663,7 +660,7 @@ def test_standard_record_attrs_not_in_payload(make_handler):
 
 
 def test_private_attrs_not_in_payload(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     record = _make_record()
     record.__dict__["_secret"] = "hidden"
 
@@ -678,7 +675,6 @@ def test_private_attrs_not_in_payload(make_handler):
 
 def test_custom_fields_in_payload(make_handler):
     h = make_handler(
-        "key",
         container_key="c1", customer_key="cust1", database="mydb",
         database_type="postgres", table="orders", executable_key="etl-job",
     )
@@ -691,13 +687,13 @@ def test_custom_fields_in_payload(make_handler):
     assert p["database"] == "mydb"
     assert p["databaseType"] == "postgres"
     assert p["table"] == "orders"
-    assert p["executableKey"] == "etl-job"
+    assert p["executablekey"] == "etl-job"
 
 
 def test_custom_fields_from_env_vars(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_CONTAINER_KEY", "env-container")
     monkeypatch.setenv("LOGGING_DATABASE", "env-db")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         p = _payload(mock_post, h)
@@ -708,14 +704,14 @@ def test_custom_fields_from_env_vars(monkeypatch, make_handler):
 
 def test_explicit_custom_field_takes_precedence_over_env(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_DATABASE", "env-db")
-    h = make_handler("key", database="explicit-db")
+    h = make_handler( database="explicit-db")
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["database"] == "explicit-db"
 
 
 def test_empty_custom_fields_not_in_payload(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         p = _payload(mock_post, h)
@@ -726,7 +722,7 @@ def test_empty_custom_fields_not_in_payload(make_handler):
 
 def test_whitespace_only_custom_field_env_var_ignored(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_DATABASE", "   ")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "database" not in _payload(mock_post, h)
@@ -738,13 +734,13 @@ def test_whitespace_only_custom_field_env_var_ignored(monkeypatch, make_handler)
 
 def test_invalid_site_emits_warning():
     with pytest.warns(UserWarning, match="does not look like a valid hostname"):
-        h = dd_handler("key", site="not a hostname!")
+        h = dd_handler("a" * 32, site="not a hostname!")
     h.close()
 
 
 def test_valid_site_no_warning():
     for s in ("datadoghq.eu", "us3.datadoghq.com", "ddog-gov.com"):
-        h = dd_handler("key", site=s)
+        h = dd_handler("a" * 32, site=s)
         h.close()
 
 
@@ -754,7 +750,7 @@ def test_valid_site_no_warning():
 
 def test_service_from_dd_service_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SERVICE", "env-service")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["service"] == "env-service"
@@ -762,7 +758,7 @@ def test_service_from_dd_service_env(monkeypatch, make_handler):
 
 def test_explicit_service_takes_precedence_over_dd_service(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SERVICE", "env-service")
-    h = make_handler("key", service="explicit-service")
+    h = make_handler( service="explicit-service")
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["service"] == "explicit-service"
@@ -770,14 +766,14 @@ def test_explicit_service_takes_precedence_over_dd_service(monkeypatch, make_han
 
 def test_version_from_dd_version_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_VERSION", "1.2.3")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["version"] == "1.2.3"
 
 
 def test_version_not_in_payload_when_unset(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "version" not in _payload(mock_post, h)
@@ -796,7 +792,7 @@ def test_whitespace_api_key_treated_as_empty(monkeypatch):
 
 def test_whitespace_dd_service_treated_as_unset(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SERVICE", "   ")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "service" not in _payload(mock_post, h)
@@ -807,7 +803,7 @@ def test_whitespace_dd_service_treated_as_unset(monkeypatch, make_handler):
 # ---------------------------------------------------------------------------
 
 def test_user_agent_header_sent(make_handler):
-    h = make_handler("key")
+    h = make_handler()
     assert "simple-log-handlers/" in h._client.headers["user-agent"]
 
 
@@ -816,7 +812,7 @@ def test_user_agent_header_sent(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_payload_is_a_json_list(make_handler):
-    h = make_handler("key", compress=False)
+    h = make_handler( compress=False)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -835,19 +831,19 @@ def test_datadog_handler_importable_from_package():
 
 def test_level_from_dd_log_level_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_LOG_LEVEL", "DEBUG")
-    h = make_handler("key")
+    h = make_handler()
     assert h.level == logging.DEBUG
 
 
 def test_explicit_level_takes_precedence_over_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_LOG_LEVEL", "DEBUG")
-    h = make_handler("key", level=logging.ERROR)
+    h = make_handler( level=logging.ERROR)
     assert h.level == logging.ERROR
 
 
 def test_invalid_dd_log_level_env_falls_back_to_warning(monkeypatch, make_handler):
     monkeypatch.setenv("DD_LOG_LEVEL", "NONSENSE")
-    h = make_handler("key")
+    h = make_handler()
     assert h.level == logging.WARNING
 
 
@@ -856,14 +852,15 @@ def test_invalid_dd_log_level_env_falls_back_to_warning(monkeypatch, make_handle
 # ---------------------------------------------------------------------------
 
 def test_repr_redacts_api_key(make_handler):
-    h = make_handler("secretkey1234")
+    key = "abcdef01" * 4
+    h = make_handler(key)
     r = repr(h)
-    assert "secr***" in r
-    assert "secretkey1234" not in r
+    assert "abcd***" in r
+    assert key not in r
 
 
 def test_repr_shows_service_and_level(make_handler):
-    h = make_handler("key", service="myapp", level=logging.ERROR)
+    h = make_handler( service="myapp", level=logging.ERROR)
     r = repr(h)
     assert "myapp" in r
     assert "ERROR" in r
@@ -874,7 +871,7 @@ def test_repr_shows_service_and_level(make_handler):
 # ---------------------------------------------------------------------------
 
 def test_arbitrary_attributes_in_payload(make_handler):
-    h = make_handler("key", attributes={"region": "eu-west-1", "team": "backend"})
+    h = make_handler( attributes={"region": "eu-west-1", "team": "backend"})
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         p = _payload(mock_post, h)
@@ -884,14 +881,14 @@ def test_arbitrary_attributes_in_payload(make_handler):
 
 
 def test_attributes_dict_cannot_overwrite_reserved_keys(make_handler):
-    h = make_handler("key", service="real", attributes={"service": "spoofed"})
+    h = make_handler( service="real", attributes={"service": "spoofed"})
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["service"] == "real"
 
 
 def test_whitespace_values_in_attributes_dict_dropped(make_handler):
-    h = make_handler("key", attributes={"region": "  "})
+    h = make_handler( attributes={"region": "  "})
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "region" not in _payload(mock_post, h)
@@ -903,7 +900,7 @@ def test_whitespace_values_in_attributes_dict_dropped(make_handler):
 
 def test_service_from_logging_service_env(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_SERVICE", "shared-service")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["service"] == "shared-service"
@@ -912,7 +909,7 @@ def test_service_from_logging_service_env(monkeypatch, make_handler):
 def test_dd_service_takes_precedence_over_logging_service(monkeypatch, make_handler):
     monkeypatch.setenv("DD_SERVICE", "dd-service")
     monkeypatch.setenv("LOGGING_SERVICE", "shared-service")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["service"] == "dd-service"
@@ -920,7 +917,7 @@ def test_dd_service_takes_precedence_over_logging_service(monkeypatch, make_hand
 
 def test_env_from_logging_env_env_var(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_ENV", "shared-env")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "env:shared-env" in _payload(mock_post, h)["ddtags"]
@@ -929,7 +926,7 @@ def test_env_from_logging_env_env_var(monkeypatch, make_handler):
 def test_dd_env_takes_precedence_over_logging_env(monkeypatch, make_handler):
     monkeypatch.setenv("DD_ENV", "dd-env")
     monkeypatch.setenv("LOGGING_ENV", "shared-env")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert "env:dd-env" in _payload(mock_post, h)["ddtags"]
@@ -937,7 +934,7 @@ def test_dd_env_takes_precedence_over_logging_env(monkeypatch, make_handler):
 
 def test_version_from_logging_version_env(monkeypatch, make_handler):
     monkeypatch.setenv("LOGGING_VERSION", "9.9.9")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["version"] == "9.9.9"
@@ -946,7 +943,7 @@ def test_version_from_logging_version_env(monkeypatch, make_handler):
 def test_dd_version_takes_precedence_over_logging_version(monkeypatch, make_handler):
     monkeypatch.setenv("DD_VERSION", "1.0.0")
     monkeypatch.setenv("LOGGING_VERSION", "9.9.9")
-    h = make_handler("key")
+    h = make_handler()
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         assert _payload(mock_post, h)["version"] == "1.0.0"
@@ -959,7 +956,7 @@ def test_dd_version_takes_precedence_over_logging_version(monkeypatch, make_hand
 def test_localhost_hostname_suppresses_delivery():
     with patch("simple_log_handlers._dd.socket.gethostname", return_value="localhost"):
         with pytest.warns(UserWarning, match="local/loopback"):
-            h = dd_handler("key")
+            h = dd_handler("a" * 32)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -970,7 +967,7 @@ def test_localhost_hostname_suppresses_delivery():
 def test_loopback_ip_suppresses_delivery():
     with patch("simple_log_handlers._dd.socket.gethostname", return_value="127.0.0.1"):
         with pytest.warns(UserWarning, match="local/loopback"):
-            h = dd_handler("key")
+            h = dd_handler("a" * 32)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -980,7 +977,7 @@ def test_loopback_ip_suppresses_delivery():
 
 def test_send_localhost_logs_true_bypasses_suppression():
     with patch("simple_log_handlers._dd.socket.gethostname", return_value="localhost"):
-        h = dd_handler("key", send_localhost_logs=True)
+        h = dd_handler("a" * 32, send_localhost_logs=True)
     with patch.object(h._client, "post") as mock_post:
         h.emit(_make_record())
         h.flush()
@@ -989,12 +986,131 @@ def test_send_localhost_logs_true_bypasses_suppression():
 
 
 def test_non_local_hostname_not_suppressed(make_handler):
-    h = make_handler("key", hostname="prod-server-01")
+    h = make_handler( hostname="prod-server-01")
     assert not h._suppressed
 
 
 def test_real_hostname_not_treated_as_local(make_handler):
     # A hostname like "myserver.local" should NOT be suppressed —
     # .local is explicitly excluded from the check.
-    h = make_handler("key", hostname="myserver.local")
+    h = make_handler( hostname="myserver.local")
     assert not h._suppressed
+
+
+# ---------------------------------------------------------------------------
+# include_logger_name / executablekey logic
+# ---------------------------------------------------------------------------
+
+from simple_log_handlers._dd import _executable_key_var
+
+
+def test_static_executable_key_not_overridden_by_logger_name(make_handler):
+    # include_logger_name=False (default): logger name must never stomp the static key.
+    h = make_handler( executable_key="my-etl")
+    record = _make_record()
+    record.name = "prefect.flow_run"
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(record)
+        assert _payload(mock_post, h)["executablekey"] == "my-etl"
+
+
+def test_ctx_key_overrides_static_executable_key(make_handler):
+    h = make_handler( executable_key="static-key")
+    token = _executable_key_var.set("dynamic-key")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(_make_record())
+            assert _payload(mock_post, h)["executablekey"] == "dynamic-key"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_ctx_key_alone_no_logger_name_appended(make_handler):
+    # Default include_logger_name=False: ctx_key must not gain "::logger.name".
+    h = make_handler()
+    record = _make_record()
+    record.name = "prefect.flow_run"
+    token = _executable_key_var.set("my_flow")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(record)
+            assert _payload(mock_post, h)["executablekey"] == "my_flow"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_include_logger_name_true_combines_ctx_key_and_log_name(make_handler):
+    h = make_handler( include_logger_name=True)
+    record = _make_record()
+    record.name = "my_module.helper"
+    token = _executable_key_var.set("my_function")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(record)
+            assert _payload(mock_post, h)["executablekey"] == "my_function::my_module.helper"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_include_logger_name_true_uses_log_name_as_fallback(make_handler):
+    # No static key, no ctx_key → log_name is the fallback executablekey.
+    h = make_handler( include_logger_name=True)
+    record = _make_record()
+    record.name = "my_module.helper"
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(record)
+        assert _payload(mock_post, h)["executablekey"] == "my_module.helper"
+
+
+def test_include_logger_name_true_log_name_does_not_override_static_key(make_handler):
+    # With static key set and no ctx_key, log_name must not stomp it.
+    h = make_handler( executable_key="my-etl", include_logger_name=True)
+    record = _make_record()
+    record.name = "some.logger"
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(record)
+        assert _payload(mock_post, h)["executablekey"] == "my-etl"
+
+
+# ---------------------------------------------------------------------------
+# API key validation and suppression (blocking fix)
+# ---------------------------------------------------------------------------
+
+def test_malformed_api_key_warns():
+    with pytest.warns(UserWarning, match="does not look like a valid Datadog API key"):
+        h = dd_handler("not-a-valid-key")
+    h.close()
+
+
+def test_malformed_api_key_suppresses_delivery():
+    with pytest.warns(UserWarning):
+        h = dd_handler("not-a-valid-key")
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        h.flush()
+        mock_post.assert_not_called()
+    h.close()
+
+
+def test_empty_api_key_suppresses_delivery(monkeypatch):
+    monkeypatch.delenv("DD_API_KEY", raising=False)
+    with pytest.warns(UserWarning):
+        h = dd_handler()
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        h.flush()
+        mock_post.assert_not_called()
+    h.close()
+
+
+def test_valid_32_hex_key_not_suppressed(make_handler):
+    h = make_handler("a" * 32)
+    assert not h._suppressed
+
+
+def test_stop_event_set_on_close(make_handler):
+    # close() must set _stop_event so any in-progress backoff wait returns immediately.
+    h = make_handler()
+    assert not h._stop_event.is_set()
+    h.close()
+    assert h._stop_event.is_set()

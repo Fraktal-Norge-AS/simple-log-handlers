@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from simple_log_handlers._context import _executable_key_var, with_executable_key
+
 try:
     _version = _pkg_version("simple-log-handlers")
 except PackageNotFoundError:
@@ -52,13 +54,16 @@ _RESERVED_PAYLOAD_KEYS: frozenset[str] = frozenset({
     # Datadog error tracking fields — populated from record.exc_info
     "error.kind", "error.message", "error.stack",
     # Custom identity fields (camelCase JSON keys mirror legacy Fraktal logger)
-    "containerKey", "customerKey", "database", "databaseType", "table", "executableKey",
+    "containerKey", "customerKey", "database", "databaseType", "table", "executablekey",
 })
 
 # Permissive regex for Datadog site hostnames. We warn rather than raise on
 # unknown values because Datadog adds regions periodically and hard-coding an
 # allow-list would break users on new or custom endpoints.
 _SITE_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+# Datadog API keys are exactly 32 lowercase hex characters.
+_API_KEY_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 # Hostnames that strongly indicate a local or development machine.
 # socket.gethostname() returning one of these means logs should not be
@@ -122,7 +127,7 @@ def _build_attributes(
         (database,      "LOGGING_DATABASE",       "database"),
         (database_type, "LOGGING_DATABASE_TYPE",  "databaseType"),
         (table,         "LOGGING_TABLE",           "table"),
-        (executable_key,"LOGGING_EXECUTABLE_KEY", "executableKey"),
+        (executable_key,"LOGGING_EXECUTABLE_KEY", "executablekey"),
     ]
     result = {
         json_key: value
@@ -149,7 +154,7 @@ class _DatadogHandler(logging.Handler):
         env: str | None = None,
         version: str | None = None,
         hostname: str = "",
-        source: str = "python",
+        source: str | None = None,
         tags: list[str] | None = None,
         site: str = "datadoghq.com",
         compress: bool = True,
@@ -168,6 +173,7 @@ class _DatadogHandler(logging.Handler):
         max_retries: int = 3,
         shutdown_timeout: float = 5.0,
         suppressed: bool = False,
+        include_logger_name: bool = False,
     ) -> None:
         super().__init__()
         self._suppressed = suppressed
@@ -189,13 +195,22 @@ class _DatadogHandler(logging.Handler):
         self._queue_size = queue_size
         self._overflow_warned = False
         self._closed = False
+        self._stop_event = threading.Event()
 
+        self._include_logger_name = include_logger_name
         self._attributes = _build_attributes(
             container_key, customer_key, database, database_type, table, executable_key,
             attributes,
         )
         # User-Agent identifies this library in Datadog's access logs and
         # any proxy sitting in front of the intake — useful for debugging.
+        # httpx logs every outbound request at INFO level. Since this handler
+        # is typically attached to the root logger, those messages would be
+        # shipped back to Datadog, creating a feedback loop. Silence them here
+        # because the transport is an implementation detail of this library.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
         self._client = httpx.Client(
             timeout=timeout,
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
@@ -279,16 +294,17 @@ class _DatadogHandler(logging.Handler):
                 tags.append(f"env:{self._env}")
 
             payload: dict[str, Any] = {
-                "ddsource": self._source,
                 "hostname": self._hostname,
                 # self.format() respects any formatter the user attached via
                 # setFormatter(), falling back to logging's default formatter.
                 # The default formatter DOES include the traceback in the
                 # message string when record.exc_info is set.
-                "message": self.format(record),
+                "message": _ANSI_RE.sub("", self.format(record)),
                 "status": _STATUS_MAP.get(record.levelno, record.levelname.lower()),
                 "timestamp": round(record.created * 1000),
             }
+            if self._source:
+                payload["ddsource"] = self._source
             if self._service:
                 payload["service"] = self._service
             if self._version:
@@ -314,6 +330,22 @@ class _DatadogHandler(logging.Handler):
             # Per-handler identity attributes merged before extras so
             # reserved keys cannot be overwritten by log callers.
             payload.update(self._attributes)
+
+            ctx_key = _executable_key_var.get()
+
+            if self._include_logger_name:
+                # Logger names "root" and "__main__" carry no useful identity and are excluded.
+                log_name = record.name if record.name not in ("root", "__main__") else None
+                if ctx_key and log_name:
+                    payload["executablekey"] = f"{ctx_key}::{log_name}"
+                elif ctx_key:
+                    payload["executablekey"] = ctx_key
+                elif log_name and "executablekey" not in self._attributes:
+                    # Only use log_name as fallback when no static key was configured.
+                    payload["executablekey"] = log_name
+            else:
+                if ctx_key:
+                    payload["executablekey"] = ctx_key
 
             # Forward non-standard LogRecord fields set via extra={}.
             # Keys colliding with _RESERVED_PAYLOAD_KEYS are dropped —
@@ -420,7 +452,12 @@ class _DatadogHandler(logging.Handler):
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status in {429, 500, 502, 503, 504} and attempt < self._max_retries:
-                    time.sleep(self._backoff(attempt, exc.response.headers.get("Retry-After")))
+                    # Use stop_event.wait instead of time.sleep so close() can
+                    # interrupt the backoff immediately rather than blocking for
+                    # the full sleep duration. wait() returns True if the event
+                    # was set (shutdown), False if it timed out (keep retrying).
+                    if self._stop_event.wait(self._backoff(attempt, exc.response.headers.get("Retry-After"))):
+                        return
                     continue
                 sys.stderr.write(
                     f"simple-log-handlers: failed to deliver {len(batch)} log(s): HTTP {status}\n"
@@ -428,7 +465,8 @@ class _DatadogHandler(logging.Handler):
                 return
             except Exception as exc:
                 if attempt < self._max_retries:
-                    time.sleep(self._backoff(attempt))
+                    if self._stop_event.wait(self._backoff(attempt)):
+                        return
                     continue
                 sys.stderr.write(
                     f"simple-log-handlers: failed to deliver {len(batch)} log(s): {exc}\n"
@@ -468,6 +506,7 @@ class _DatadogHandler(logging.Handler):
         if self._closed:
             return
         self._closed = True
+        self._stop_event.set()
         self.flush()
         try:
             self._queue.put(_STOP, timeout=self._shutdown_timeout)
@@ -499,6 +538,7 @@ class _DatadogHandler(logging.Handler):
         self._queue = queue.Queue(maxsize=self._queue_size)
         self._overflow_warned = False
         self._closed = False
+        self._stop_event = threading.Event()
         self._client = httpx.Client(
             timeout=self._timeout_val,
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
@@ -513,7 +553,7 @@ def dd_handler(
     env: str | None = None,
     version: str | None = None,
     hostname: str | None = None,
-    source: str = "python",
+    source: str | None = None,
     tags: list[str] | None = None,
     site: str | None = None,
     compress: bool = True,
@@ -533,6 +573,7 @@ def dd_handler(
     shutdown_timeout: float = 5.0,
     send_localhost_logs: bool = False,
     level: int | None = None,
+    include_logger_name: bool = False,
 ) -> _DatadogHandler:
     # Strip whitespace from all env var resolutions so that a value like
     # "\n" or "  " from a misconfigured environment is treated as absent.
@@ -540,6 +581,13 @@ def dd_handler(
     if not resolved_key:
         warnings.warn(
             "dd_handler: api_key is empty (DD_API_KEY not set) — logs will not be delivered",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif not _API_KEY_RE.match(resolved_key):
+        warnings.warn(
+            f"dd_handler: api_key {resolved_key[:4]!r}... does not look like a valid Datadog "
+            "API key (expected 32 hex characters) — logs will not be delivered",
             UserWarning,
             stacklevel=2,
         )
@@ -560,12 +608,14 @@ def dd_handler(
     resolved_service = (service or os.environ.get("DD_SERVICE", "") or os.environ.get("LOGGING_SERVICE", "")).strip() or None
     resolved_env     = (env     or os.environ.get("DD_ENV",     "") or os.environ.get("LOGGING_ENV",     "")).strip() or None
     resolved_version = (version or os.environ.get("DD_VERSION", "") or os.environ.get("LOGGING_VERSION", "")).strip() or None
+    resolved_source  = (source  or os.environ.get("DD_SOURCE",  "") or os.environ.get("LOGGING_SOURCE",  "")).strip() or None
 
     # Suppress delivery when the resolved hostname is unambiguously local
     # (e.g. "localhost") and the caller has not opted in via send_localhost_logs.
     resolved_hostname = _resolve_hostname(hostname)
-    suppressed = not send_localhost_logs and _is_local_hostname(resolved_hostname)
-    if suppressed:
+    key_invalid = not resolved_key or not _API_KEY_RE.match(resolved_key)
+    suppressed = key_invalid or (not send_localhost_logs and _is_local_hostname(resolved_hostname))
+    if suppressed and not key_invalid:
         warnings.warn(
             f"dd_handler: hostname {resolved_hostname!r} is a local/loopback address; "
             "log delivery is suppressed to avoid accidentally shipping to a production "
@@ -593,7 +643,7 @@ def dd_handler(
         env=resolved_env,
         version=resolved_version,
         hostname=resolved_hostname,
-        source=source,
+        source=resolved_source,
         tags=tags,
         site=resolved_site,
         compress=compress,
@@ -612,6 +662,7 @@ def dd_handler(
         max_retries=max_retries,
         shutdown_timeout=shutdown_timeout,
         suppressed=suppressed,
+        include_logger_name=include_logger_name,
     )
     handler.setLevel(resolved_level)
     return handler

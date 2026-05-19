@@ -540,7 +540,7 @@ def test_retry_on_transient_http_error(make_handler):
         return MagicMock()
 
     with patch.object(h._client, "post", side_effect=flaky_post):
-        with patch("simple_log_handlers._otel.time.sleep"):
+        with patch.object(h._stop_event, "wait", return_value=False):
             h.emit(_make_record())
             h.flush()
 
@@ -568,7 +568,7 @@ def test_no_retry_on_non_transient_error(make_handler):
 
 def test_retry_after_header_honored(make_handler):
     h = make_handler(max_retries=1, batch_timeout=0.01)
-    sleeps: list[float] = []
+    waits: list[float] = []
     attempt = 0
 
     def rate_limited(*args: object, **kwargs: object) -> MagicMock:
@@ -582,11 +582,11 @@ def test_retry_after_header_honored(make_handler):
         return MagicMock()
 
     with patch.object(h._client, "post", side_effect=rate_limited):
-        with patch("simple_log_handlers._otel.time.sleep", side_effect=sleeps.append):
+        with patch.object(h._stop_event, "wait", side_effect=lambda secs: waits.append(secs) or False):
             h.emit(_make_record())
             h.flush()
 
-    assert sleeps[0] == pytest.approx(7.0)
+    assert waits[0] == pytest.approx(7.0)
 
 
 def test_network_failure_does_not_crash_worker(make_handler):
@@ -738,7 +738,7 @@ def test_non_serialisable_extra_does_not_drop_log(make_handler):
 def test_identity_fields_in_resource_attributes(make_handler):
     h = make_handler(
         container_key="c1", customer_key="cust1", database="mydb",
-        database_type="postgres", table="orders", executable_key="etl",
+        database_type="postgres", table="orders",
         compress=False,
     )
     with patch.object(h._client, "post") as mock_post:
@@ -750,7 +750,16 @@ def test_identity_fields_in_resource_attributes(make_handler):
     assert ra["database"] == "mydb"
     assert ra["database_type"] == "postgres"
     assert ra["table"] == "orders"
-    assert ra["executable_key"] == "etl"
+    assert "executable_key" not in ra  # moved to per-record attributes
+
+
+def test_executable_key_in_log_record_attributes(make_handler):
+    h = make_handler(executable_key="etl", compress=False)
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+
+    assert attrs["executable_key"] == "etl"
 
 
 def test_identity_fields_from_logging_env_vars(monkeypatch, make_handler):
@@ -1068,3 +1077,99 @@ def test_dot_local_hostname_not_suppressed(make_handler):
     # production LAN environments.
     h = make_handler(hostname="myserver.local")
     assert not h._suppressed
+
+
+# ---------------------------------------------------------------------------
+# Endpoint validation and suppression
+# ---------------------------------------------------------------------------
+
+def test_empty_endpoint_suppresses_delivery(monkeypatch):
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", raising=False)
+    with pytest.warns(UserWarning):
+        h = otel_handler()
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        h.flush()
+        mock_post.assert_not_called()
+    h.close()
+
+
+def test_malformed_endpoint_warns_and_suppresses():
+    with pytest.warns(UserWarning, match="does not look like a valid"):
+        h = otel_handler("not-a-url")
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        h.flush()
+        mock_post.assert_not_called()
+    h.close()
+
+
+def test_valid_https_endpoint_not_suppressed(make_handler):
+    h = make_handler("https://collector.example.com:4318")
+    assert not h._suppressed
+
+
+# ---------------------------------------------------------------------------
+# executable_key / with_executable_key / include_logger_name
+# ---------------------------------------------------------------------------
+
+from simple_log_handlers._context import _executable_key_var
+
+
+def test_static_executable_key_in_log_record(make_handler):
+    h = make_handler(executable_key="my-etl", compress=False)
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(_make_record())
+        attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+    assert attrs["executable_key"] == "my-etl"
+
+
+def test_ctx_key_overrides_static_executable_key(make_handler):
+    h = make_handler(executable_key="static", compress=False)
+    token = _executable_key_var.set("dynamic")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(_make_record())
+            attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+        assert attrs["executable_key"] == "dynamic"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_ctx_key_alone_no_logger_name_appended(make_handler):
+    h = make_handler(compress=False)
+    record = _make_record()
+    record.name = "prefect.flow_run"
+    token = _executable_key_var.set("my_flow")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(record)
+            attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+        assert attrs["executable_key"] == "my_flow"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_include_logger_name_true_combines_ctx_key_and_log_name(make_handler):
+    h = make_handler(include_logger_name=True, compress=False)
+    record = _make_record()
+    record.name = "my_module.helper"
+    token = _executable_key_var.set("my_function")
+    try:
+        with patch.object(h._client, "post") as mock_post:
+            h.emit(record)
+            attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+        assert attrs["executable_key"] == "my_function::my_module.helper"
+    finally:
+        _executable_key_var.reset(token)
+
+
+def test_executable_key_not_spoofable_via_extra(make_handler):
+    h = make_handler(executable_key="real", compress=False)
+    record = _make_record()
+    record.__dict__["executable_key"] = "spoofed"  # type: ignore[assignment]
+    with patch.object(h._client, "post") as mock_post:
+        h.emit(record)
+        attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
+    assert attrs["executable_key"] == "real"

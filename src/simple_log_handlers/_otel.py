@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import random
+import re
 import socket
 import sys
 import threading
@@ -18,6 +19,8 @@ from importlib.metadata import version as _pkg_version
 from typing import Any
 
 import httpx
+
+from simple_log_handlers._context import _executable_key_var
 
 try:
     _version = _pkg_version("simple-log-handlers")
@@ -65,6 +68,7 @@ _RESERVED_ATTRIBUTE_KEYS: frozenset[str] = frozenset({
     "exception.type",
     "exception.message",
     "exception.stacktrace",
+    "executable_key",
 })
 
 
@@ -74,6 +78,9 @@ class _Sentinel:
 
 _STOP = _Sentinel()
 
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+_ENDPOINT_RE = re.compile(r"^https?://[^\s/]+", re.IGNORECASE)
 
 _LOCAL_HOSTNAME_SET: frozenset[str] = frozenset({
     "localhost",
@@ -144,7 +151,6 @@ def _build_resource_attrs(
     database: str | None,
     database_type: str | None,
     table: str | None,
-    executable_key: str | None,
     attributes: dict[str, str] | None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     result: list[dict[str, Any]] = []
@@ -160,13 +166,14 @@ def _build_resource_attrs(
 
     # Fraktal identity fields — use snake_case to follow OTEL attribute
     # naming conventions (contrast: camelCase in the Datadog handler).
+    # executable_key is intentionally excluded here — it is invocation-scoped
+    # and is written as a per-record attribute in emit() instead.
     for attr_key, value in (
         ("container_key",  container_key),
         ("customer_key",   customer_key),
         ("database",       database),
         ("database_type",  database_type),
         ("table",          table),
-        ("executable_key", executable_key),
     ):
         if value:
             result.append(_otlp_attr(attr_key, value))
@@ -203,9 +210,13 @@ class _OtelHandler(logging.Handler):
         max_retries: int,
         shutdown_timeout: float,
         suppressed: bool = False,
+        executable_key: str | None = None,
+        include_logger_name: bool = False,
     ) -> None:
         super().__init__()
         self._suppressed = suppressed
+        self._executable_key = executable_key
+        self._include_logger_name = include_logger_name
         self._url = url
         self._headers = headers
         self._service = service
@@ -219,6 +230,7 @@ class _OtelHandler(logging.Handler):
         self._queue_size = queue_size
         self._overflow_warned = False
         self._closed = False
+        self._stop_event = threading.Event()
 
         # Pre-serialise the resource and scope fragments once at construction.
         # _send_batch() assembles the full OTLP envelope by byte-concatenation —
@@ -293,7 +305,7 @@ class _OtelHandler(logging.Handler):
                 "observedTimeUnixNano": str(time.time_ns()),
                 "severityNumber": _severity_number(record.levelno),
                 "severityText": record.levelname,
-                "body": {"stringValue": self.format(record)},
+                "body": {"stringValue": _ANSI_RE.sub("", self.format(record))},
             }
 
             attributes: list[dict[str, Any]] = []
@@ -321,6 +333,26 @@ class _OtelHandler(logging.Handler):
                     and not k.startswith("_")
                 ):
                     attributes.append(_otlp_attr(k, v))
+
+            # Resolve executable_key: context var overrides static key.
+            # Logger name appended only when include_logger_name=True.
+            ctx_key = _executable_key_var.get()
+            exec_value: str | None = None
+            if self._include_logger_name:
+                log_name = record.name if record.name not in ("root", "__main__") else None
+                if ctx_key and log_name:
+                    exec_value = f"{ctx_key}::{log_name}"
+                elif ctx_key:
+                    exec_value = ctx_key
+                elif log_name and not self._executable_key:
+                    exec_value = log_name
+            else:
+                if ctx_key:
+                    exec_value = ctx_key
+            if exec_value is None and self._executable_key:
+                exec_value = self._executable_key
+            if exec_value:
+                attributes.append(_otlp_attr("executable_key", exec_value))
 
             if attributes:
                 log_record["attributes"] = attributes
@@ -403,7 +435,8 @@ class _OtelHandler(logging.Handler):
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 if status in {429, 500, 502, 503, 504} and attempt < self._max_retries:
-                    time.sleep(self._backoff(attempt, exc.response.headers.get("Retry-After")))
+                    if self._stop_event.wait(self._backoff(attempt, exc.response.headers.get("Retry-After"))):
+                        return
                     continue
                 sys.stderr.write(
                     f"simple-log-handlers: failed to deliver {len(batch)} log(s): HTTP {status}\n"
@@ -411,7 +444,8 @@ class _OtelHandler(logging.Handler):
                 return
             except Exception as exc:
                 if attempt < self._max_retries:
-                    time.sleep(self._backoff(attempt))
+                    if self._stop_event.wait(self._backoff(attempt)):
+                        return
                     continue
                 sys.stderr.write(
                     f"simple-log-handlers: failed to deliver {len(batch)} log(s): {exc}\n"
@@ -446,6 +480,7 @@ class _OtelHandler(logging.Handler):
         if self._closed:
             return
         self._closed = True
+        self._stop_event.set()
         self.flush()
         try:
             self._queue.put(_STOP, timeout=self._shutdown_timeout)
@@ -470,6 +505,7 @@ class _OtelHandler(logging.Handler):
         self._queue = queue.Queue(maxsize=self._queue_size)
         self._overflow_warned = False
         self._closed = False
+        self._stop_event = threading.Event()
         self._client = httpx.Client(
             timeout=self._timeout_val,
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
@@ -502,6 +538,7 @@ def otel_handler(
     shutdown_timeout: float = 5.0,
     send_localhost_logs: bool = False,
     level: int | None = None,
+    include_logger_name: bool = False,
 ) -> _OtelHandler:
     # Endpoint: logs-specific env var takes precedence over the generic one,
     # matching the OTEL SDK's own resolution order.
@@ -511,16 +548,27 @@ def otel_handler(
         or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
         or ""
     ).strip()
+    endpoint_invalid = False
     if not resolved_endpoint:
+        endpoint_invalid = True
         warnings.warn(
             "otel_handler: endpoint is empty — logs will not be delivered",
             UserWarning,
             stacklevel=2,
         )
-    elif not resolved_endpoint.rstrip("/").endswith("/v1/logs"):
+    elif not _ENDPOINT_RE.match(resolved_endpoint):
+        endpoint_invalid = True
+        warnings.warn(
+            f"otel_handler: endpoint {resolved_endpoint!r} does not look like a valid "
+            "http(s):// URL — logs will not be delivered",
+            UserWarning,
+            stacklevel=2,
+        )
+    else:
         # Loose suffix check: any path ending in "/v1/logs" is left as-is,
         # everything else gets the standard OTLP logs path appended.
-        resolved_endpoint = resolved_endpoint.rstrip("/") + "/v1/logs"
+        if not resolved_endpoint.rstrip("/").endswith("/v1/logs"):
+            resolved_endpoint = resolved_endpoint.rstrip("/") + "/v1/logs"
 
     # Headers: env var provides defaults, explicit dict wins on collision.
     resolved_headers: dict[str, str] = {}
@@ -571,8 +619,8 @@ def otel_handler(
         return (arg or os.environ.get(env_var, "")).strip() or None
 
     resolved_hostname = _resolve_hostname(hostname)
-    suppressed = not send_localhost_logs and _is_local_hostname(resolved_hostname)
-    if suppressed:
+    suppressed = endpoint_invalid or (not send_localhost_logs and _is_local_hostname(resolved_hostname))
+    if suppressed and not endpoint_invalid:
         warnings.warn(
             f"otel_handler: hostname {resolved_hostname!r} is a local/loopback address; "
             "log delivery is suppressed to avoid accidentally shipping to a production "
@@ -581,6 +629,8 @@ def otel_handler(
             UserWarning,
             stacklevel=2,
         )
+
+    resolved_executable_key = _field(executable_key, "LOGGING_EXECUTABLE_KEY")
 
     resource_attrs, attr_collisions = _build_resource_attrs(
         service=resolved_service,
@@ -592,7 +642,6 @@ def otel_handler(
         database=_field(database,           "LOGGING_DATABASE"),
         database_type=_field(database_type, "LOGGING_DATABASE_TYPE"),
         table=_field(table,                 "LOGGING_TABLE"),
-        executable_key=_field(executable_key, "LOGGING_EXECUTABLE_KEY"),
         attributes=attributes,
     )
     for _k in attr_collisions:
@@ -617,6 +666,8 @@ def otel_handler(
         max_retries=max_retries,
         shutdown_timeout=shutdown_timeout,
         suppressed=suppressed,
+        executable_key=resolved_executable_key,
+        include_logger_name=include_logger_name,
     )
     handler.setLevel(resolved_level)
     return handler
