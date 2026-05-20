@@ -81,12 +81,12 @@ _LOCAL_HOSTNAME_SET: frozenset[str] = frozenset({
 
 # Holds the executable key for the current invocation context. Set via the
 # with_executable_key decorator; read in emit() as a fallback when no static
-# executableKey was configured on the handler.
+# executablekey was configured on the handler.
 _executable_key_var: ContextVar[str | None] = ContextVar("simple_log_handlers_executable_key", default=None)
 
 
 def with_executable_key(func_or_name=None):
-    """Decorator that sets executableKey on all log records emitted during a function call.
+    """Decorator that sets executablekey on all log records emitted during a function call.
 
     Usage::
 
