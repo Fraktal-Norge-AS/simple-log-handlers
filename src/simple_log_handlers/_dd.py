@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import atexit
-import functools
 import gzip
 import json
 import logging
@@ -16,7 +14,6 @@ import threading
 import time
 import traceback
 import warnings
-from contextvars import ContextVar
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any
@@ -77,48 +74,6 @@ _LOCAL_HOSTNAME_SET: frozenset[str] = frozenset({
     "127.0.0.1",
     "::1",
 })
-
-
-# Holds the executable key for the current invocation context. Set via the
-# with_executable_key decorator; read in emit() as a fallback when no static
-# executablekey was configured on the handler.
-_executable_key_var: ContextVar[str | None] = ContextVar("simple_log_handlers_executable_key", default=None)
-
-
-def with_executable_key(func_or_name=None):
-    """Decorator that sets executablekey on all log records emitted during a function call.
-
-    Usage::
-
-        @with_executable_key                    # uses func.__name__
-        def my_function(): ...
-
-        @with_executable_key("custom_name")     # explicit name
-        def my_function(): ...
-    """
-    def decorator(func):
-        key = func_or_name if isinstance(func_or_name, str) else func.__name__
-        if asyncio.iscoroutinefunction(func):
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                token = _executable_key_var.set(key)
-                try:
-                    return await func(*args, **kwargs)
-                finally:
-                    _executable_key_var.reset(token)
-            return async_wrapper
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            token = _executable_key_var.set(key)
-            try:
-                return func(*args, **kwargs)
-            finally:
-                _executable_key_var.reset(token)
-        return sync_wrapper
-
-    if callable(func_or_name):
-        return decorator(func_or_name)
-    return decorator
 
 
 def _is_local_hostname(hostname: str) -> bool:
