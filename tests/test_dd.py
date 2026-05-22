@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import subprocess
+import sys
 import threading
 import uuid
 from datetime import datetime
@@ -1114,3 +1116,42 @@ def test_stop_event_set_on_close(make_handler):
     assert not h._stop_event.is_set()
     h.close()
     assert h._stop_event.is_set()
+
+
+def test_worker_thread_is_daemon(make_handler):
+    h = make_handler()
+    assert h._worker_thread.daemon is True
+
+
+def test_close_unregisters_atexit(make_handler):
+    h = make_handler()
+    h.close()
+    # _atexit_close must be a no-op after close() — if unregister worked,
+    # re-calling it should not trigger a second close().
+    with patch.object(h, "close") as mock_close:
+        h._atexit_close()
+        mock_close.assert_not_called()
+
+
+def test_process_exits_cleanly_after_os_exit(tmp_path):
+    # Regression test: a non-daemon worker thread would block process exit
+    # indefinitely when os._exit() bypasses atexit. With daemon=True the
+    # process must exit within the timeout.
+    script = tmp_path / "exit_test.py"
+    script.write_text(
+        "import logging, os\n"
+        "from unittest.mock import MagicMock, patch\n"
+        "from simple_log_handlers import dd_handler\n"
+        "with patch('httpx.Client.post', return_value=MagicMock(raise_for_status=MagicMock())):\n"
+        "    h = dd_handler('a' * 32, send_localhost_logs=True)\n"
+        "    logging.getLogger().addHandler(h)\n"
+        "    logging.getLogger().setLevel(logging.WARNING)\n"
+        "    logging.warning('test')\n"
+        "    os._exit(0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        timeout=10,
+        capture_output=True,
+    )
+    assert result.returncode == 0

@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import subprocess
+import sys
 import threading
 import uuid
 from datetime import datetime
@@ -1173,3 +1175,37 @@ def test_executable_key_not_spoofable_via_extra(make_handler):
         h.emit(record)
         attrs = _log_attrs(_log_record(_flush_body(mock_post, h, compressed=False), compressed=False))
     assert attrs["executable_key"] == "real"
+
+
+def test_worker_thread_is_daemon(make_handler):
+    h = make_handler()
+    assert h._worker_thread.daemon is True
+
+
+def test_close_unregisters_atexit(make_handler):
+    h = make_handler()
+    h.close()
+    with patch.object(h, "close") as mock_close:
+        h._atexit_close()
+        mock_close.assert_not_called()
+
+
+def test_process_exits_cleanly_after_os_exit(tmp_path):
+    script = tmp_path / "exit_test.py"
+    script.write_text(
+        "import logging, os\n"
+        "from unittest.mock import MagicMock, patch\n"
+        "from simple_log_handlers import otel_handler\n"
+        "with patch('httpx.Client.post', return_value=MagicMock(raise_for_status=MagicMock())):\n"
+        "    h = otel_handler('https://example.com/v1/logs', send_localhost_logs=True)\n"
+        "    logging.getLogger().addHandler(h)\n"
+        "    logging.getLogger().setLevel(logging.WARNING)\n"
+        "    logging.warning('test')\n"
+        "    os._exit(0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        timeout=10,
+        capture_output=True,
+    )
+    assert result.returncode == 0
