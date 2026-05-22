@@ -22,10 +22,12 @@ _OTEL_ENV_VARS = [
 
 _COLOR_ENV_VARS = ["NO_COLOR", "FORCE_COLOR"]
 
+_DLT_ENV_VARS = ["DLT_LOG_FORMAT"]
+
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove all env vars this library reads so developer shell state cannot
     affect test results or leak real credentials into the test suite."""
-    for var in _DD_ENV_VARS + _LOGGING_ENV_VARS + _OTEL_ENV_VARS + _COLOR_ENV_VARS:
+    for var in _DD_ENV_VARS + _LOGGING_ENV_VARS + _OTEL_ENV_VARS + _COLOR_ENV_VARS + _DLT_ENV_VARS:
         monkeypatch.delenv(var, raising=False)

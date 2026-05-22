@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from simple_log_handlers._context import _executable_key_var, with_executable_key
+from simple_log_handlers._dlt import install_dlt_json_filter as _install_dlt_json_filter
 
 try:
     _version = _pkg_version("simple-log-handlers")
@@ -665,6 +666,7 @@ def dd_handler(
         include_logger_name=include_logger_name,
     )
     handler.setLevel(resolved_level)
+    _install_dlt_json_filter()
     return handler
 
 
