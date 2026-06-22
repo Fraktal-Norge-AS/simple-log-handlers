@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from simple_log_handlers._context import _executable_key_var
+from simple_log_handlers._dlt import install_dlt_json_filter as _install_dlt_json_filter
 
 try:
     _version = _pkg_version("simple-log-handlers")
@@ -277,10 +278,15 @@ class _OtelHandler(logging.Handler):
     # ------------------------------------------------------------------
 
     def _start_worker(self) -> None:
+        # Daemon so the thread cannot block interpreter exit. atexit runs
+        # before daemon threads are killed, so close() still flushes in-flight
+        # batches on a normal exit. If os._exit() bypasses atexit (as Prefect
+        # can do), logs still in the queue at that point are unavoidably lost —
+        # but the process exits cleanly rather than hanging forever.
         self._worker_thread = threading.Thread(
             target=self._run_worker,
             name="simple-log-handlers-otel-worker",
-            daemon=False,
+            daemon=True,
         )
         self._worker_thread.start()
         atexit.register(self._atexit_close)
@@ -480,8 +486,8 @@ class _OtelHandler(logging.Handler):
         if self._closed:
             return
         self._closed = True
+        atexit.unregister(self._atexit_close)
         self._stop_event.set()
-        self.flush()
         try:
             self._queue.put(_STOP, timeout=self._shutdown_timeout)
         except queue.Full:
@@ -670,6 +676,7 @@ def otel_handler(
         include_logger_name=include_logger_name,
     )
     handler.setLevel(resolved_level)
+    _install_dlt_json_filter()
     return handler
 
 
