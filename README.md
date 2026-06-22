@@ -257,6 +257,36 @@ Logs are sent as **OTLP/HTTP JSON** (`Content-Type: application/json`, gzip by d
 
 ---
 
+### `install_dlt_json_filter`
+
+Cleans up [dlt](https://dlthub.com) pipeline logs when dlt is configured to emit JSON (`DLT_LOG_FORMAT=json`). dlt's JSON-mode records carry a JSON-encoded message; this filter unwraps it into a plain, human-readable message and forwards `dlt_module`/`dlt_version` as structured extras on `dd_handler`/`otel_handler`.
+
+`dd_handler()` and `otel_handler()` call this automatically with default options — most users don't need to call it directly. Call it explicitly *before* constructing a handler if you want non-default options:
+
+```python
+from simple_log_handlers import install_dlt_json_filter, dd_handler
+import logging
+
+install_dlt_json_filter(
+    module_levels={"client": logging.WARNING},  # silence noisy dlt submodules
+    include_module_in_logger_name=True,          # executablekey -> "my_pipeline::dlt.client"
+)
+handler = dd_handler(api_key="...", include_logger_name=True)
+```
+
+- No-ops (returns `None`) unless `DLT_LOG_FORMAT` is set to `json` (case-insensitive).
+- Idempotent — calling it more than once does not attach a duplicate filter to the `dlt` logger.
+- Attaches a `DltJsonFilter` to the `"dlt"` logger, which also drops records below a per-module threshold via `module_levels` before they reach any handler.
+
+`DltJsonFilter` is also exported directly if you want to attach it to a different logger or compose it manually:
+
+```python
+from simple_log_handlers import DltJsonFilter
+logging.getLogger("dlt").addFilter(DltJsonFilter(module_levels={"client": logging.WARNING}))
+```
+
+---
+
 ## Design notes
 
 These notes explain decisions that are not obvious from the code. They are written down so that future maintainers understand *why* things are done the way they are, not just *what* they do.
@@ -273,11 +303,15 @@ This resolves three subtle failure modes:
 
 3. **`handleError()` requires the record.** If serialisation fails (e.g. an unserializable object slips through despite `default=str`), `handleError(record)` can still be called with the original record in `emit()`. If we deferred serialisation to the worker, the record would no longer be available.
 
-### Why non-daemon thread + atexit
+### Why the worker thread is daemonic
 
-The worker thread is created with `daemon=False`. Daemon threads are killed mid-write at interpreter shutdown, which would silently drop the tail of the queue. The non-daemon thread keeps the interpreter alive until it exits.
+The worker thread is created with `daemon=True`. This looks backwards at first — daemon threads are normally "fire and forget" — but it's required for the `atexit`-based shutdown to work at all.
 
-An `atexit` hook is registered to call `close()` for processes that never call `logging.shutdown()`. The two mechanisms are complementary: `logging.shutdown()` goes through the handler's `close()` method via the logging machinery; `atexit` catches everything else.
+CPython's interpreter shutdown joins all **non-daemon** threads *before* it runs `atexit` callbacks. If the worker thread were non-daemon, the interpreter would block forever waiting for it to finish — but the only thing that tells the worker thread to stop is `close()`, which (absent an explicit `handler.close()`/`logging.shutdown()` call) only runs *via* that same `atexit` hook, **after** the join. That's a deadlock: the interpreter waits on a thread that is waiting for a stop signal it will never receive, because the code that would send it never gets to run. This is exactly the hang seen in process-based runners (e.g. Prefect) that let the interpreter exit naturally instead of calling `logging.shutdown()` themselves.
+
+With `daemon=True`, interpreter shutdown skips waiting on the worker thread and goes straight to running `atexit` callbacks, so `close()` runs normally: it sets `_stop_event`, pushes the `_STOP` sentinel, and joins the thread with a bounded `shutdown_timeout` — flushing in-flight batches on a normal exit. `close()` also calls `atexit.unregister(self._atexit_close)`, so an earlier explicit `close()`/`logging.shutdown()` call doesn't leave a stale callback registered.
+
+The remaining edge case: if something bypasses `atexit` entirely (`os._exit()`, which process supervisors sometimes use to force a clean process tree exit), any logs still queued at that point are unavoidably lost. That's an acceptable trade-off — the process exits promptly rather than hanging forever.
 
 ### Why three fork hooks
 
