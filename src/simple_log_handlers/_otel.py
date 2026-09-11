@@ -232,6 +232,8 @@ class _OtelHandler(logging.Handler):
         self._overflow_warned = False
         self._closed = False
         self._stop_event = threading.Event()
+        self._worker_started = False
+        self._worker_start_lock = threading.Lock()
 
         # Pre-serialise the resource and scope fragments once at construction.
         # _send_batch() assembles the full OTLP envelope by byte-concatenation —
@@ -252,7 +254,11 @@ class _OtelHandler(logging.Handler):
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
         )
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_size)
-        self._start_worker()
+        # Lazy worker start — see the matching comment in _DatadogHandler.
+        # Constructing a handler must not start a background thread; only
+        # the first emit() does. That's what keeps import-only paths
+        # (prefect deploy, test collection, etc.) from leaving a thread
+        # running that can hang interpreter shutdown on Windows.
 
         # Fork-safety: same three-hook pattern as _DatadogHandler.
         # os.register_at_fork is POSIX-only (not available on Windows).
@@ -291,6 +297,19 @@ class _OtelHandler(logging.Handler):
         self._worker_thread.start()
         atexit.register(self._atexit_close)
 
+    def _ensure_worker_started(self) -> None:
+        # Double-checked locking: the fast path (already started) takes no
+        # lock, since this runs on every emit(). The lock only matters the
+        # first time, when concurrent callers from multiple threads could
+        # otherwise both pass the check and start two worker threads.
+        if self._worker_started:
+            return
+        with self._worker_start_lock:
+            if self._worker_started:
+                return
+            self._start_worker()
+            self._worker_started = True
+
     def _atexit_close(self) -> None:
         if not self._closed:
             self.close()
@@ -302,6 +321,7 @@ class _OtelHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if self._suppressed:
             return
+        self._ensure_worker_started()
         # Build and serialise the OTLP log record entirely on the caller's
         # thread. Same rationale as _DatadogHandler: arg mutation safety,
         # captureWarnings() reentrancy, and handleError() availability.
@@ -473,7 +493,7 @@ class _OtelHandler(logging.Handler):
     # ------------------------------------------------------------------
 
     def flush(self) -> None:
-        if self._closed:
+        if self._closed or not self._worker_started:
             return
         event = threading.Event()
         try:
@@ -486,13 +506,14 @@ class _OtelHandler(logging.Handler):
         if self._closed:
             return
         self._closed = True
-        atexit.unregister(self._atexit_close)
         self._stop_event.set()
-        try:
-            self._queue.put(_STOP, timeout=self._shutdown_timeout)
-        except queue.Full:
-            pass
-        self._worker_thread.join(timeout=self._shutdown_timeout)
+        if self._worker_started:
+            atexit.unregister(self._atexit_close)
+            try:
+                self._queue.put(_STOP, timeout=self._shutdown_timeout)
+            except queue.Full:
+                pass
+            self._worker_thread.join(timeout=self._shutdown_timeout)
         self._client.close()
         super().close()
 
@@ -516,7 +537,12 @@ class _OtelHandler(logging.Handler):
             timeout=self._timeout_val,
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
         )
-        self._start_worker()
+        # Only recreate the worker if the parent had actually started one —
+        # a handler that was constructed but never used before the fork
+        # should stay lazy in the child too.
+        if self._worker_started:
+            self._worker_started = False
+            self._ensure_worker_started()
 
 
 def otel_handler(

@@ -1120,7 +1120,21 @@ def test_stop_event_set_on_close(make_handler):
 
 def test_worker_thread_is_daemon(make_handler):
     h = make_handler()
+    h.emit(_make_record())  # worker starts lazily, on first emit()
     assert h._worker_thread.daemon is True
+
+
+def test_worker_not_started_until_first_emit(make_handler):
+    # Constructing a handler must be side-effect-free: no background thread
+    # should exist until something is actually logged. This is what keeps
+    # import-only paths (prefect deploy, test collection, etc.) from hanging
+    # on interpreter shutdown.
+    h = make_handler()
+    assert h._worker_started is False
+    assert not hasattr(h, "_worker_thread")
+    h.emit(_make_record())
+    assert h._worker_started is True
+    assert h._worker_thread.is_alive()
 
 
 def test_close_unregisters_atexit(make_handler):
@@ -1131,6 +1145,15 @@ def test_close_unregisters_atexit(make_handler):
     with patch.object(h, "close") as mock_close:
         h._atexit_close()
         mock_close.assert_not_called()
+
+
+def test_close_without_ever_emitting_does_not_raise(make_handler):
+    # Regression test: close()/the atexit path used to assume
+    # self._worker_thread always existed, which broke for a handler that was
+    # constructed but never used before shutdown.
+    h = make_handler()
+    h.close()
+    assert h._closed
 
 
 def test_process_exits_cleanly_after_os_exit(tmp_path):

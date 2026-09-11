@@ -197,6 +197,8 @@ class _DatadogHandler(logging.Handler):
         self._overflow_warned = False
         self._closed = False
         self._stop_event = threading.Event()
+        self._worker_started = False
+        self._worker_start_lock = threading.Lock()
 
         self._include_logger_name = include_logger_name
         self._attributes = _build_attributes(
@@ -217,7 +219,19 @@ class _DatadogHandler(logging.Handler):
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
         )
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_size)
-        self._start_worker()
+        # The worker thread is started lazily, on first emit() — not here.
+        # Constructing a handler must be a cheap, side-effect-free operation:
+        # tooling that imports a module to introspect it (prefect deploy,
+        # test collection, sphinx autodoc, --help paths) can end up
+        # constructing a handler without ever logging through it. Starting a
+        # background thread in __init__ meant that import-only path silently
+        # left a thread running, which on Windows can hang interpreter
+        # shutdown even though the thread is daemon=True — daemon status only
+        # guarantees the process *can* exit, not that it exits promptly, and
+        # this exact scenario (module-owned thread, never explicitly closed)
+        # reproduced a hang in production under `prefect deploy`. If no
+        # record is ever emitted, no thread ever starts, and there is
+        # nothing to hang on.
 
         # Fork-safety: a forked child inherits this handler's open sockets
         # and worker thread — but the thread doesn't exist in the child and
@@ -269,6 +283,19 @@ class _DatadogHandler(logging.Handler):
         self._worker_thread.start()
         atexit.register(self._atexit_close)
 
+    def _ensure_worker_started(self) -> None:
+        # Double-checked locking: the fast path (already started) takes no
+        # lock, since this runs on every emit(). The lock only matters the
+        # first time, when concurrent callers from multiple threads could
+        # otherwise both pass the check and start two worker threads.
+        if self._worker_started:
+            return
+        with self._worker_start_lock:
+            if self._worker_started:
+                return
+            self._start_worker()
+            self._worker_started = True
+
     def _atexit_close(self) -> None:
         if not self._closed:
             self.close()
@@ -280,6 +307,7 @@ class _DatadogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if self._suppressed:
             return
+        self._ensure_worker_started()
         # Build and serialise the payload entirely on the caller's thread.
         # This is the critical design decision: we do NOT enqueue the raw
         # LogRecord and format it in the worker.
@@ -496,7 +524,7 @@ class _DatadogHandler(logging.Handler):
         # it, delivers any buffered batch and sets the event — at which point
         # this call unblocks. This guarantees all records enqueued *before*
         # this flush() call have been delivered.
-        if self._closed:
+        if self._closed or not self._worker_started:
             return
         event = threading.Event()
         try:
@@ -509,13 +537,14 @@ class _DatadogHandler(logging.Handler):
         if self._closed:
             return
         self._closed = True
-        atexit.unregister(self._atexit_close)
         self._stop_event.set()
-        try:
-            self._queue.put(_STOP, timeout=self._shutdown_timeout)
-        except queue.Full:
-            pass
-        self._worker_thread.join(timeout=self._shutdown_timeout)
+        if self._worker_started:
+            atexit.unregister(self._atexit_close)
+            try:
+                self._queue.put(_STOP, timeout=self._shutdown_timeout)
+            except queue.Full:
+                pass
+            self._worker_thread.join(timeout=self._shutdown_timeout)
         self._client.close()
         super().close()
 
@@ -546,7 +575,12 @@ class _DatadogHandler(logging.Handler):
             timeout=self._timeout_val,
             headers={"User-Agent": f"simple-log-handlers/{_version}"},
         )
-        self._start_worker()
+        # Only recreate the worker if the parent had actually started one —
+        # a handler that was constructed but never used before the fork
+        # should stay lazy in the child too.
+        if self._worker_started:
+            self._worker_started = False
+            self._ensure_worker_started()
 
 
 def dd_handler(
